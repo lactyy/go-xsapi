@@ -211,10 +211,12 @@ func (c *Client) CloseContext(ctx context.Context) (err error) {
 		err = errors.Join(
 			c.mpsd.CloseContext(ctx),
 			c.social.CloseContext(ctx),
-			c.chat.Close(),
 
 			c.rta.Close(),
 		)
+		if c.chat != nil {
+			err = errors.Join(c.chat.Close())
+		}
 	})
 	return err
 }
