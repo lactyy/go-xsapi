@@ -105,21 +105,25 @@ func (c *Client) CloseContext(ctx context.Context) error {
 
 	c.closing.Store(true)
 	defer c.closing.Store(false)
-	c.subscriptionSeq.Add(1)
 
 	c.subscriptionMu.Lock()
-	defer c.subscriptionMu.Unlock()
 	if c.subscribeDone != nil {
 		close(c.subscribeDone)
 		c.subscribeDone = nil
 	}
+	subscription := c.subscription
+	c.subscriptionMu.Unlock()
 
-	if c.subscription != nil {
-		if err := c.unsub.Unsubscribe(ctx, c.subscription); err != nil {
+	if subscription != nil {
+		if err := c.unsub.Unsubscribe(ctx, subscription); err != nil {
 			return fmt.Errorf("xsapi/social: unsubscribe RTA: %w", err)
 		}
-		c.subscription = nil
 	}
+
+	c.subscriptionMu.Lock()
+	c.subscriptionSeq.Add(1)
+	c.subscription = nil
 	c.subscriptionHandlers = nil
+	c.subscriptionMu.Unlock()
 	return nil
 }

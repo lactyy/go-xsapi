@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/df-mc/go-xsapi/v2/internal"
@@ -107,11 +108,11 @@ func (c *Client) Publish(ctx context.Context, ref SessionReference, config Publi
 
 	// Newly create a multiplayer session.
 	// This request call will fail if the session already exists.
-	req, err := internal.WithJSONBody(ctx, http.MethodPut, ref.URL().String(), d, append(opts,
+	req, err := internal.WithJSONBody(ctx, http.MethodPut, ref.URL().String(), d, slices.Concat(opts, []internal.RequestOption{
 		internal.RequestHeader("Content-Type", "application/json"),
 		internal.RequestHeader("If-None-Match", "*"),
 		internal.ContractVersion(contractVersion),
-	))
+	}))
 	if err != nil {
 		return nil, fmt.Errorf("make request: %w", err)
 	}
@@ -140,6 +141,7 @@ func (c *Client) Publish(ctx context.Context, ref SessionReference, config Publi
 // connection reconciliation is still in flight.
 func (c *Client) createSessionAndReconcile(ctx context.Context, ref SessionReference, resp *http.Response, connectionID uuid.UUID, action string) (*Session, error) {
 	backgroundSeq := c.backgroundSeq.Load()
+	subscriptionSeq := c.subscriptionSeq.Load()
 	s, err := c.createSession(ctx, ref, resp)
 	if err != nil {
 		return nil, err
@@ -148,9 +150,9 @@ func (c *Client) createSessionAndReconcile(ctx context.Context, ref SessionRefer
 		s.log.Warn("automatic session tracking lost before initial reconcile")
 		return s, nil
 	}
-	if err := c.reconcileSessionConnectionWithInstall(ctx, s, connectionID, c.backgroundInstallGate(backgroundSeq)); err != nil {
+	if err := c.reconcileSessionConnectionWithInstall(ctx, s, connectionID, c.subscriptionInstallGate(subscriptionSeq)); err != nil {
 		s.log.Error("error reconciling session connection after "+action, slog.Any("error", err))
-		go c.retryReconcileSessionConnection(s, connectionID, backgroundSeq)
+		go c.retryReconcileSessionConnection(s, connectionID, backgroundSeq, subscriptionSeq)
 	}
 	return s, nil
 }

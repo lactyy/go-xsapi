@@ -303,10 +303,12 @@ type SubscriptionHandler interface {
 	// not need to call [Conn.Unsubscribe].
 	//
 	// If err is nil, the Subscription was successfully re-established on the
-	// new connection and has been assigned a new ID. The custom data may also
-	// differ from the previous connection depending on the targeting resource.
-	// In this case, the handler remains responsible for calling [Conn.Unsubscribe]
-	// during cleanup.
+	// new connection and has been assigned a new ID. This callback is fired as
+	// soon as that re-subscribe handshake succeeds, before the reconnect wave's
+	// optional stabilization delay has elapsed. The custom data may also differ
+	// from the previous connection depending on the targeting resource. In this
+	// case, the handler remains responsible for calling [Conn.Unsubscribe] during
+	// cleanup.
 	HandleReconnect(err error)
 }
 
@@ -506,6 +508,15 @@ func (c *Conn) reconnect(done chan struct{}) {
 
 		successes := c.resubscribe()
 		readerDone := c.currentReaderDone()
+		successDone := make([]<-chan struct{}, len(successes))
+		for i, subscription := range successes {
+			successDone[i] = c.startReconnectSuccess(subscription)
+			c.log.Debug("resubscribed", slog.Group("subscription",
+				slog.Uint64("id", uint64(subscription.ID())),
+				slog.String("custom", string(subscription.Custom())),
+				slog.String("resourceURI", subscription.ResourceURI()),
+			))
+		}
 		if len(successes) != 0 {
 			select {
 			case <-time.After(reconnectSettleDelay):
@@ -515,13 +526,8 @@ func (c *Conn) reconnect(done chan struct{}) {
 			}
 		}
 		if c.reconnectWaveStable(readerDone) {
-			for _, subscription := range successes {
-				go c.notifyReconnectSuccess(subscription)
-				c.log.Debug("resubscribed", slog.Group("subscription",
-					slog.Uint64("id", uint64(subscription.ID())),
-					slog.String("custom", string(subscription.Custom())),
-					slog.String("resourceURI", subscription.ResourceURI()),
-				))
+			for i, subscription := range successes {
+				go c.notifyReconnectReadyAfterSuccess(subscription, successDone[i], readerDone)
 			}
 			return
 		}
@@ -690,11 +696,21 @@ func (c *Conn) finishReconnectFailureHandler() {
 	}
 }
 
-// notifyReconnectSuccess delivers reconnect success before any ready-to-act
-// callback for the same subscription.
+// notifyReconnectSuccess delivers reconnect success as soon as the
+// subscription handshake on the replacement connection has succeeded.
 func (c *Conn) notifyReconnectSuccess(subscription *Subscription) {
 	subscription.handler().HandleReconnect(nil)
-	c.notifyReconnectReady(subscription)
+}
+
+// startReconnectSuccess launches notifyReconnectSuccess asynchronously and
+// returns a channel that closes once the handler returns.
+func (c *Conn) startReconnectSuccess(subscription *Subscription) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.notifyReconnectSuccess(subscription)
+	}()
+	return done
 }
 
 // notifyReconnectReady fires [ReconnectReadyHandler.HandleReconnectReady] for
@@ -706,6 +722,18 @@ func (c *Conn) notifyReconnectReady(subscription *Subscription) {
 		return
 	}
 	handler.HandleReconnectReady()
+}
+
+// notifyReconnectReadyAfterSuccess waits for the reconnect-success callback to
+// return before firing the ready callback for the same subscription.
+func (c *Conn) notifyReconnectReadyAfterSuccess(subscription *Subscription, successDone <-chan struct{}, readerDone chan struct{}) {
+	if successDone != nil {
+		<-successDone
+	}
+	if c.ctx.Err() != nil || !c.reconnectWaveStable(readerDone) {
+		return
+	}
+	c.notifyReconnectReady(subscription)
 }
 
 // Active reports whether sub is currently registered on this connection.

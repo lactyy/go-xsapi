@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -116,11 +117,15 @@ type Client struct {
 	refreshingSeq uint64
 	// refreshCancel cancels the context of the currently active refresh wave.
 	refreshCancel context.CancelFunc
+	// subscriptionSeq is incremented each time the live subscription state is
+	// torn down so in-flight install/reconcile work from the previous generation
+	// cannot repopulate stale subscription state after a successful close or loss.
+	subscriptionSeq atomic.Uint64
 	// closing is set while [Client.CloseContext] is running to prevent new
 	// background work from starting.
 	closing atomic.Bool
-	// backgroundSeq is incremented on close to invalidate in-flight
-	// background goroutines.
+	// backgroundSeq is incremented on subscription loss to invalidate stale
+	// session-tracking generations.
 	backgroundSeq atomic.Uint64
 }
 
@@ -140,9 +145,9 @@ func (c *Client) decodeSubscriptionData(subscription *rta.Subscription) (*subscr
 // was unsuccessful.
 func (c *Client) SessionByReference(ctx context.Context, ref SessionReference, opts ...internal.RequestOption) (_ *SessionDescription, err error) {
 	var d *SessionDescription
-	if err := internal.Do(ctx, c.client, http.MethodGet, ref.URL().String(), nil, &d, append(opts,
+	if err := internal.Do(ctx, c.client, http.MethodGet, ref.URL().String(), nil, &d, slices.Concat(opts, []internal.RequestOption{
 		internal.ContractVersion(contractVersion),
-	)); err != nil {
+	})); err != nil {
 		return nil, err
 	}
 	if d == nil {
@@ -169,22 +174,26 @@ func (c *Client) CloseContext(ctx context.Context) error {
 
 	c.closing.Store(true)
 	defer c.closing.Store(false)
-	c.backgroundSeq.Add(1)
 
 	c.subscriptionMu.Lock()
-	defer c.subscriptionMu.Unlock()
-	c.cancelRefreshWave()
 	if c.subscribeDone != nil {
 		close(c.subscribeDone)
 		c.subscribeDone = nil
 	}
+	subscription := c.subscription
+	c.subscriptionMu.Unlock()
 
-	if c.subscription != nil {
-		if err := c.unsub.Unsubscribe(ctx, c.subscription); err != nil {
+	if subscription != nil {
+		if err := c.unsub.Unsubscribe(ctx, subscription); err != nil {
 			return fmt.Errorf("mpsd: unsubscribe: %w", err)
 		}
-		c.clearSubscriptionLocked()
 	}
+
+	c.subscriptionMu.Lock()
+	c.subscriptionSeq.Add(1)
+	c.clearSubscriptionLocked()
+	c.subscriptionMu.Unlock()
+	c.cancelRefreshWave()
 	return nil
 }
 

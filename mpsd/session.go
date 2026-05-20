@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -184,11 +185,11 @@ func (s *Session) commit(ctx context.Context, changes SessionDescription, precon
 	if err != nil {
 		return false, false, err
 	}
-	req, err := internal.WithJSONBody(ctx, http.MethodPut, s.ref.URL().String(), changes, append(opts,
+	req, err := internal.WithJSONBody(ctx, http.MethodPut, s.ref.URL().String(), changes, slices.Concat(opts, []internal.RequestOption{
 		internal.RequestHeader("Content-Type", "application/json"),
 		internal.RequestHeader("If-Match", match),
 		internal.ContractVersion(contractVersion),
-	))
+	}))
 	if err != nil {
 		return false, false, fmt.Errorf("make request: %w", err)
 	}
@@ -228,8 +229,9 @@ const (
 	preconditionCachedETag
 )
 
-// errSessionDeleted is returned when the session is deleted.
-var errSessionDeleted = errors.New("mpsd: session deleted")
+// ErrSessionDeleted is returned when a sync or update discovers that the
+// remote session has been deleted.
+var ErrSessionDeleted = errors.New("mpsd: session deleted")
 
 // ifMatchHeader returns the If-Match header value based on the precondition.
 func (s *Session) ifMatchHeader(ctx context.Context, precondition updatePrecondition) (string, error) {
@@ -407,7 +409,7 @@ func (s *Session) Sync(ctx context.Context) error {
 			return nil
 		case http.StatusNoContent:
 			s.markDeleted()
-			return nil
+			return ErrSessionDeleted
 		default:
 			return internal.UnexpectedStatusCode(resp)
 		}
@@ -571,6 +573,7 @@ func (s *Session) finishUpdate(deleted bool, err error) error {
 	}
 	if deleted {
 		s.markDeleted()
+		return ErrSessionDeleted
 	}
 	return nil
 }
@@ -599,7 +602,7 @@ func (s *Session) synchronizedUpdateWhile(ctx context.Context, changes SessionDe
 		}
 
 		deleted, conflict, err := s.commit(ctx, changes, preconditionCachedETag, opts)
-		if errors.Is(err, errSessionDeleted) {
+		if errors.Is(err, ErrSessionDeleted) {
 			return true, nil
 		}
 		if err != nil {
@@ -622,7 +625,7 @@ func (s *Session) synchronizedUpdateWhile(ctx context.Context, changes SessionDe
 
 // currentETag returns the last observed session ETag, refreshing it from MPSD
 // if necessary. If the refresh discovers that the session no longer exists,
-// errSessionDeleted is returned.
+// ErrSessionDeleted is returned.
 func (s *Session) currentETag(ctx context.Context) (string, error) {
 	// If the ETag is already set, return it.
 	s.cacheMu.RLock()
@@ -644,7 +647,7 @@ func (s *Session) currentETag(ctx context.Context) (string, error) {
 	if etag == "" {
 		// A sync that closed the session means the remote session was deleted.
 		if s.isClosed() {
-			return "", errSessionDeleted
+			return "", ErrSessionDeleted
 		}
 		return "", errors.New("mpsd: synchronized update requires ETag")
 	}
@@ -699,10 +702,17 @@ type SessionReference struct {
 // URL returns the URL locating to the HTTP resource of the session.
 func (ref SessionReference) URL() *url.URL {
 	return endpoint.JoinPath(
-		"/serviceconfigs/", ref.ServiceConfigID.String(),
-		"/sessionTemplates", ref.TemplateName,
-		"/sessions", ref.Name,
+		"serviceconfigs", ref.ServiceConfigID.String(),
+		"sessionTemplates", ref.TemplateName,
+		"sessions", ref.Name,
 	)
+}
+
+// Equal reports whether ref and target refer to the same multiplayer session.
+func (ref SessionReference) Equal(target SessionReference) bool {
+	return ref.ServiceConfigID == target.ServiceConfigID &&
+		strings.EqualFold(ref.TemplateName, target.TemplateName) &&
+		strings.EqualFold(ref.Name, target.Name)
 }
 
 // parseSessionReference parses a [SessionReference] from the value of the
@@ -728,7 +738,7 @@ func parseSessionReference(loc string) (ref SessionReference, err error) {
 	if len(segments) != 6 {
 		return ref, fmt.Errorf("malformed path: %q", u.Path)
 	}
-	if !strings.EqualFold(segments[0], "serviceconfigs") || !strings.EqualFold(segments[2], "sessionTemplates") || segments[4] != "sessions" {
+	if !strings.EqualFold(segments[0], "serviceconfigs") || !strings.EqualFold(segments[2], "sessionTemplates") || !strings.EqualFold(segments[4], "sessions") {
 		return ref, fmt.Errorf("invalid path to session: %q", u.Path)
 	}
 

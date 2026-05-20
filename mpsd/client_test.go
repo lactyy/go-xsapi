@@ -178,6 +178,92 @@ func TestClientCloseContextSerializesConcurrentCalls(t *testing.T) {
 	}
 }
 
+func TestClientCloseContextDoesNotHoldSubscriptionMuDuringUnsubscribe(t *testing.T) {
+	subscription := &rta.Subscription{}
+	unsub := &fakeUnsubscriber{
+		called:  make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	client := &Client{
+		subscription:     subscription,
+		subscriptionData: &subscriptionData{ConnectionID: uuid.New()},
+		unsub:            unsub,
+		log:              slogDiscard(),
+		sessions:         map[string]*Session{},
+	}
+	handler := &subscriptionHandler{
+		Client:             client,
+		sourceSubscription: subscription,
+		log:                slogDiscard(),
+	}
+
+	closeErr := make(chan error, 1)
+	go func() {
+		closeErr <- client.CloseContext(context.Background())
+	}()
+
+	select {
+	case <-unsub.called:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for CloseContext to start unsubscribe")
+	}
+
+	handlerDone := make(chan struct{})
+	go func() {
+		handler.HandleReconnect(errors.New("reconnect failed"))
+		close(handlerDone)
+	}()
+
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("HandleReconnect blocked behind CloseContext unsubscribe")
+	}
+
+	close(unsub.release)
+
+	select {
+	case err := <-closeErr:
+		if err != nil {
+			t.Fatalf("CloseContext returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for CloseContext to finish")
+	}
+}
+
+func TestClientCloseContextDoesNotCancelRefreshWaveOnUnsubscribeError(t *testing.T) {
+	canceled := make(chan struct{}, 1)
+	client := &Client{
+		subscription:     &rta.Subscription{},
+		subscriptionData: &subscriptionData{ConnectionID: uuid.New()},
+		unsub:            &fakeUnsubscriber{failures: 1},
+		refreshSeq:       1,
+		refreshingSeq:    1,
+		refreshCancel: func() {
+			select {
+			case canceled <- struct{}{}:
+			default:
+			}
+		},
+	}
+
+	if err := client.CloseContext(context.Background()); err == nil {
+		t.Fatal("expected unsubscribe error")
+	}
+	select {
+	case <-canceled:
+		t.Fatal("refresh wave was canceled after unsubscribe failure")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if client.refreshCancel == nil {
+		t.Fatal("refreshCancel was cleared after unsubscribe failure")
+	}
+	if client.refreshingSeq != 1 {
+		t.Fatalf("refreshingSeq = %d, want 1 after unsubscribe failure", client.refreshingSeq)
+	}
+}
+
 func TestClientSubscribeReturnsUnavailableWithoutSubscriber(t *testing.T) {
 	client := &Client{}
 
@@ -491,7 +577,7 @@ func TestClientRetryReconcileSessionConnectionRepairsSession(t *testing.T) {
 	session.log = slogDiscard()
 	session.etag = `"etag"`
 	client.sessions[ref.URL().String()] = session
-	go client.retryReconcileSessionConnection(session, connectionID1, client.backgroundSeq.Load())
+	go client.retryReconcileSessionConnection(session, connectionID1, client.backgroundSeq.Load(), client.subscriptionSeq.Load())
 
 	select {
 	case <-repaired:
@@ -500,6 +586,54 @@ func TestClientRetryReconcileSessionConnectionRepairsSession(t *testing.T) {
 	}
 	if attempts < 2 {
 		t.Fatalf("attempts = %d, want at least 2", attempts)
+	}
+}
+
+func TestSubscriptionHandlerMatchesShoulderTapReferencesCaseInsensitively(t *testing.T) {
+	ref := SessionReference{
+		ServiceConfigID: uuid.New(),
+		TemplateName:    "Template",
+		Name:            "SESSION",
+	}
+	changed := make(chan struct{}, 1)
+	client := &Client{
+		client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			wantPath := "/" + ref.URL().Path
+			if got := req.URL.Path; got != wantPath {
+				t.Fatalf("request path = %q, want %q", got, wantPath)
+			}
+			header := make(http.Header)
+			header.Set("ETag", `"next"`)
+			return testResponse(req, http.StatusOK, header, []byte(`{}`)), nil
+		})},
+		log:      slogDiscard(),
+		sessions: map[string]*Session{},
+	}
+	session := testSession(ref, client, SessionDescription{})
+	session.Handle(sessionChangeHandler(func(*Session) {
+		select {
+		case changed <- struct{}{}:
+		default:
+		}
+	}))
+	client.sessions[ref.URL().String()] = session
+	handler := &subscriptionHandler{
+		Client: client,
+		log:    slogDiscard(),
+	}
+
+	payload, err := json.Marshal(subscriptionEvent{ShoulderTaps: []shoulderTap{{
+		Resource: ref.ServiceConfigID.String() + "~template~session",
+	}}})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	handler.HandleEvent(payload)
+
+	select {
+	case <-changed:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for case-insensitive shoulder tap match")
 	}
 }
 
@@ -538,6 +672,72 @@ func TestSubscriptionHandlerHandleReconnectErrorClearsSubscription(t *testing.T)
 	}
 	if _, ok := client.sessions[ref.URL().String()]; ok {
 		t.Fatal("tracked session was not removed after reconnect failure")
+	}
+}
+
+func TestSubscriptionHandlerHandleReconnectSuccessStartsRefreshWave(t *testing.T) {
+	oldConnectionID := uuid.New()
+	newConnectionID := uuid.New()
+	subscription := &rta.Subscription{}
+	ref := SessionReference{
+		ServiceConfigID: uuid.New(),
+		TemplateName:    "template",
+		Name:            "SESSION",
+	}
+
+	refreshed := make(chan struct{}, 1)
+	client := &Client{
+		log:      slogDiscard(),
+		sessions: map[string]*Session{},
+		decode: func(got *rta.Subscription) (*subscriptionData, error) {
+			if got != subscription {
+				t.Fatalf("decoded subscription = %p, want %p", got, subscription)
+			}
+			return &subscriptionData{ConnectionID: newConnectionID}, nil
+		},
+	}
+	client.subscription = subscription
+	client.subscriptionData = &subscriptionData{ConnectionID: oldConnectionID}
+	client.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method != http.MethodPut {
+			t.Fatalf("request method = %s, want PUT", req.Method)
+		}
+		var body SessionDescription
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		member := body.Members["me"]
+		if member == nil || member.Properties == nil || member.Properties.System == nil {
+			t.Fatalf("member system properties missing: %+v", member)
+		}
+		if got := member.Properties.System.Connection; got != newConnectionID {
+			t.Fatalf("connection ID = %s, want %s", got, newConnectionID)
+		}
+		header := make(http.Header)
+		header.Set("ETag", `"etag"`)
+		select {
+		case refreshed <- struct{}{}:
+		default:
+		}
+		return testResponse(req, http.StatusOK, header, []byte(`{}`)), nil
+	})}
+
+	session := testSession(ref, client, SessionDescription{})
+	session.log = slogDiscard()
+	session.etag = `"etag"`
+	client.sessions[ref.URL().String()] = session
+
+	handler := &subscriptionHandler{
+		Client:             client,
+		sourceSubscription: subscription,
+		log:                slogDiscard(),
+	}
+	handler.HandleReconnect(nil)
+
+	select {
+	case <-refreshed:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for refresh wave after reconnect success")
 	}
 }
 
@@ -1036,7 +1236,7 @@ func TestRetryReconcileSessionConnectionMarksTrackingLostWhenLateAttachFails(t *
 	session.log = slogDiscard()
 	session.etag = `"etag"`
 
-	go client.retryReconcileSessionConnection(session, initialConnectionID, client.backgroundSeq.Load())
+	go client.retryReconcileSessionConnection(session, initialConnectionID, client.backgroundSeq.Load(), client.subscriptionSeq.Load())
 
 	select {
 	case <-requestDone:
@@ -1109,7 +1309,7 @@ func TestRetryReconcileSessionConnectionDoesNotStealTrackingFromReplacementHandl
 	}
 
 	go func() {
-		client.retryReconcileSessionConnection(oldSession, initialConnectionID, client.backgroundSeq.Load())
+		client.retryReconcileSessionConnection(oldSession, initialConnectionID, client.backgroundSeq.Load(), client.subscriptionSeq.Load())
 		close(done)
 	}()
 
@@ -1167,7 +1367,7 @@ func TestRetryReconcileSessionConnectionMarksTrackingLostWhenGenerationChangesBe
 
 	done := make(chan struct{})
 	go func() {
-		client.retryReconcileSessionConnection(session, uuid.New(), backgroundSeq)
+		client.retryReconcileSessionConnection(session, uuid.New(), backgroundSeq, client.subscriptionSeq.Load())
 		close(done)
 	}()
 
@@ -1220,7 +1420,7 @@ func TestRetryReconcileSessionConnectionMarksTrackingLostAfterRetryExhaustion(t 
 
 	done := make(chan struct{})
 	go func() {
-		client.retryReconcileSessionConnection(session, uuid.New(), client.backgroundSeq.Load())
+		client.retryReconcileSessionConnection(session, uuid.New(), client.backgroundSeq.Load(), client.subscriptionSeq.Load())
 		close(done)
 	}()
 

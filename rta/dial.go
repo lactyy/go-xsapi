@@ -13,7 +13,7 @@ import (
 //
 // The [context.Context] is used to control the deadline of the establishment of the WebSocket connection.
 // The [http.Client] is used to authenticate handshake HTTP requests and is typically retrieved from
-// [github.com/df-mc/go-xspai.Client.HTTPClient].
+// [github.com/df-mc/go-xsapi/v2.Client.HTTPClient].
 func Dial(ctx context.Context, client *http.Client, log *slog.Logger) (*Conn, error) {
 	if log == nil {
 		log = slog.Default()

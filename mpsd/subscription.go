@@ -24,6 +24,10 @@ var errSubscriptionUnavailable = errors.New("mpsd: subscription unavailable")
 // connection ID before giving up and marking tracking as lost.
 const maxReconcileAttempts = 5
 
+// maxReconnectBackoff is the largest delay used between reconnect repair
+// retries for a single session.
+const maxReconnectBackoff = 5 * time.Second
+
 // subscribe subscribes with the RTA (Real-Time Activity) Services in Xbox Live.
 // The subscription is used to associate with a multiplayer session to receive
 // notifications for changes in the session.
@@ -33,7 +37,7 @@ func (c *Client) subscribe(ctx context.Context) (_ *rta.Subscription, _ *subscri
 			return nil, nil, err
 		}
 	}
-	return c.subscribeWithInstall(ctx, c.backgroundInstallGate(c.backgroundSeq.Load()))
+	return c.subscribeWithInstall(ctx, c.subscriptionInstallGate(c.subscriptionSeq.Load()))
 }
 
 // subscribeWithInstall returns an active subscription, reusing the cached one
@@ -226,32 +230,51 @@ func (h *subscriptionHandler) HandleEvent(custom json.RawMessage) {
 	}
 
 	h.sessionsMu.RLock()
+	sessions := make([]*Session, 0, len(h.sessions))
 	for _, session := range h.sessions {
-		if slices.Contains(refs, session.ref) {
-			go func(s *Session) {
-				ctx, cancel := context.WithTimeout(s.Context(), time.Second*15)
-				defer cancel()
+		if slices.ContainsFunc(refs, func(reference SessionReference) bool {
+			// Shoulder taps may deliver TemplateName and Name in lowercase,
+			// so use case-insensitive matching.
+			return reference.Equal(session.Reference())
+		}) {
+			sessions = append(sessions, session)
+		}
+	}
+	h.sessionsMu.RUnlock()
 
-				if err := s.Sync(ctx); err != nil {
-					h.log.Error("error synchronizing multiplayer session",
-						slog.Any("error", err))
-					return
-				}
+	for _, session := range sessions {
+		go func(s *Session) {
+			ctx, cancel := context.WithTimeout(s.Context(), time.Second*15)
+			defer cancel()
+
+			err := s.Sync(ctx)
+			if err != nil && !errors.Is(err, ErrSessionDeleted) {
+				h.log.Error("error synchronizing multiplayer session",
+					slog.Any("error", err))
+				return
+			}
+			if errors.Is(err, ErrSessionDeleted) {
+				h.log.Debug("multiplayer session deleted",
+					slog.Group("session",
+						slog.String("ref", s.Reference().URL().String()),
+					),
+				)
+			} else {
 				h.log.Debug("synchronized multiplayer session",
 					slog.Group("session",
 						slog.String("ref", s.Reference().URL().String()),
 					),
 				)
-				s.handler().HandleSessionChange(s)
-			}(session)
-		}
+			}
+			s.handler().HandleSessionChange(s)
+		}(session)
 	}
-	h.sessionsMu.RUnlock()
 }
 
 // HandleReconnect implements [rta.SubscriptionHandler].
 func (h *subscriptionHandler) HandleReconnect(err error) {
 	if err == nil {
+		h.handleReconnectSuccess()
 		return
 	}
 
@@ -297,15 +320,15 @@ func (h *subscriptionHandler) handleStaleReconnectFailureLocked(err error) bool 
 	return true
 }
 
-// HandleReconnectReady implements [rta.ReconnectReadyHandler] so MPSD can
-// rebind tracked sessions as soon as its own subscription has been refreshed.
-func (h *subscriptionHandler) HandleReconnectReady() {
-	h.handleReconnectSuccess()
-}
+// HandleReconnectReady implements [rta.ReconnectReadyHandler]. MPSD rebinding
+// happens in HandleReconnect(nil) so tracked sessions switch to the new
+// connection ID as soon as the subscription handshake succeeds. This hook is
+// intentionally empty.
+func (h *subscriptionHandler) HandleReconnectReady() {}
 
-// handleReconnectSuccess is called when the RTA connection has successfully
-// re-established the subscription. It decodes the refreshed subscription data
-// and starts a refresh wave if the connection ID changed.
+// handleReconnectSuccess is called once the MPSD subscription handshake has
+// succeeded on a replacement RTA connection. It decodes the refreshed
+// subscription data and starts a refresh wave if the connection ID changed.
 func (h *subscriptionHandler) handleReconnectSuccess() {
 	h.subscriptionMu.Lock()
 	subscription := h.sourceSubscription
@@ -528,14 +551,20 @@ func (c *Client) subscriptionDataWithInstall(ctx context.Context, canInstall fun
 
 // retryReconcileSessionConnection retries reconciling a single session's
 // connection ID with exponential backoff, giving up after five attempts.
-func (c *Client) retryReconcileSessionConnection(session *Session, connectionID uuid.UUID, backgroundSeq uint64) {
-	canInstall := c.backgroundInstallGate(backgroundSeq)
+func (c *Client) retryReconcileSessionConnection(session *Session, connectionID uuid.UUID, backgroundSeq, subscriptionSeq uint64) {
+	canInstall := c.subscriptionInstallGate(subscriptionSeq)
 	for attempt := 0; ; attempt++ {
 		if err := session.Context().Err(); err != nil {
 			return
 		}
-		if !canInstall() || c.closing.Load() {
+		if c.backgroundSeq.Load() != backgroundSeq {
 			session.markTrackingLost()
+			return
+		}
+		if !canInstall() {
+			// Stop quietly when only the subscription generation changed. That can
+			// happen during an explicit client reset/close without meaning the
+			// tracked session itself was displaced by subscription loss.
 			return
 		}
 
@@ -549,7 +578,15 @@ func (c *Client) retryReconcileSessionConnection(session *Session, connectionID 
 			return
 		}
 		if errors.Is(err, net.ErrClosed) {
-			session.markTrackingLost()
+			// A closed retry only means tracking is gone when the session-tracking
+			// generation changed. Otherwise this is a client reset/close boundary,
+			// so the handle stays live and may resume once the client subscribes again.
+			if c.closing.Load() {
+				return
+			}
+			if c.backgroundSeq.Load() != backgroundSeq {
+				session.markTrackingLost()
+			}
 			return
 		}
 
@@ -569,7 +606,7 @@ func (c *Client) retryReconcileSessionConnection(session *Session, connectionID 
 
 // refreshWaveActive reports whether the current refresh wave is still valid.
 func (c *Client) refreshWaveActive(waveCtx context.Context, seq uint64) bool {
-	return !c.closing.Load() && waveCtx.Err() == nil && c.refreshSequenceActive(seq)
+	return waveCtx.Err() == nil && c.refreshSequenceActive(seq)
 }
 
 // refreshSessionConnection writes the new connection ID to a single session,
@@ -601,6 +638,9 @@ func (c *Client) retryRefreshSessionConnection(session *Session, waveCtx context
 		)
 
 		if attempt+1 >= maxReconcileAttempts {
+			return
+		}
+		if err := session.Context().Err(); err != nil || !c.refreshWaveActive(waveCtx, seq) {
 			return
 		}
 		select {
@@ -655,11 +695,11 @@ func (c *Client) refreshSequenceActive(seq uint64) bool {
 	return c.refreshingSeq == seq
 }
 
-// backgroundInstallGate returns a canInstall predicate for a single
-// background-work generation.
-func (c *Client) backgroundInstallGate(backgroundSeq uint64) func() bool {
+// subscriptionInstallGate returns a canInstall predicate for a single live
+// subscription generation.
+func (c *Client) subscriptionInstallGate(subscriptionSeq uint64) func() bool {
 	return func() bool {
-		return c.backgroundSeq.Load() == backgroundSeq && !c.closing.Load()
+		return c.subscriptionSeq.Load() == subscriptionSeq && !c.closing.Load()
 	}
 }
 
@@ -702,18 +742,18 @@ func (c *Client) shutdownTrackedSessions(lossSeq uint64) {
 // This prevents stale reconnect callbacks from mutating sessions after the
 // replacement subscription has already been invalidated.
 func (c *Client) startRefreshWaveIfCurrent(subscription *rta.Subscription, backgroundSeq uint64, connectionID uuid.UUID) bool {
-	if subscription == nil || c.closing.Load() {
+	if subscription == nil {
 		return false
 	}
 
 	c.subscriptionMu.Lock()
-	if c.subscription != subscription || c.backgroundSeq.Load() != backgroundSeq || c.closing.Load() {
+	if c.subscription != subscription || c.backgroundSeq.Load() != backgroundSeq {
 		c.subscriptionMu.Unlock()
 		return false
 	}
 
 	c.refreshMu.Lock()
-	if c.subscription != subscription || c.backgroundSeq.Load() != backgroundSeq || c.closing.Load() {
+	if c.subscription != subscription || c.backgroundSeq.Load() != backgroundSeq {
 		c.refreshMu.Unlock()
 		c.subscriptionMu.Unlock()
 		return false
@@ -753,5 +793,5 @@ func refreshInterrupted(err error, sessionCtx, waveCtx context.Context) bool {
 // reconnectBackoff returns an exponential backoff duration starting at 200ms
 // and capping at 5 seconds.
 func reconnectBackoff(attempt int) time.Duration {
-	return min(200*time.Millisecond<<attempt, 5*time.Second)
+	return min(200*time.Millisecond<<attempt, maxReconnectBackoff)
 }

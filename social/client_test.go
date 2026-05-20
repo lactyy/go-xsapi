@@ -2,6 +2,7 @@ package social
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"testing"
@@ -158,6 +159,58 @@ func TestClientCloseContextSerializesConcurrentCalls(t *testing.T) {
 	}
 }
 
+func TestClientCloseContextDoesNotHoldSubscriptionMuDuringUnsubscribe(t *testing.T) {
+	subscription := &rta.Subscription{}
+	unsub := &fakeUnsubscriber{
+		called:  make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	client := &Client{
+		subscription:         subscription,
+		subscriptionHandlers: []SubscriptionHandler{NopSubscriptionHandler{}},
+		unsub:                unsub,
+		log:                  slogDiscard(),
+	}
+	handler := &subscriptionHandler{
+		Client:             client,
+		sourceSubscription: subscription,
+	}
+
+	closeErr := make(chan error, 1)
+	go func() {
+		closeErr <- client.CloseContext(context.Background())
+	}()
+
+	select {
+	case <-unsub.called:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for CloseContext to start unsubscribe")
+	}
+
+	handlerDone := make(chan struct{})
+	go func() {
+		handler.HandleReconnect(errors.New("reconnect failed"))
+		close(handlerDone)
+	}()
+
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("HandleReconnect blocked behind CloseContext unsubscribe")
+	}
+
+	close(unsub.release)
+
+	select {
+	case err := <-closeErr:
+		if err != nil {
+			t.Fatalf("CloseContext returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for CloseContext to finish")
+	}
+}
+
 func TestClientSubscribeDoesNotRegisterHandlerWhenInitialSubscribeFails(t *testing.T) {
 	handler := NopSubscriptionHandler{}
 	sub := &fakeSubscriber{err: errors.New("subscribe failed")}
@@ -210,6 +263,52 @@ func TestSubscriptionHandlerHandleReconnectErrorPreservesHandlers(t *testing.T) 
 	}
 	if len(client.subscriptionHandlers) != 1 {
 		t.Fatalf("handlers length = %d, want 1 after reconnect failure", len(client.subscriptionHandlers))
+	}
+}
+
+func TestSubscriptionHandlerDoesNotHoldLockWhileCallingHandlers(t *testing.T) {
+	client := &Client{
+		sub:          &fakeSubscriber{},
+		subscription: &rta.Subscription{},
+		log:          slogDiscard(),
+	}
+	done := make(chan error, 1)
+	client.subscriptionHandlers = []SubscriptionHandler{
+		subscribeOnNotificationHandler{client: client, done: done},
+	}
+	handler := &subscriptionHandler{Client: client}
+
+	handleDone := make(chan struct{})
+	go func() {
+		payload, err := json.Marshal(struct {
+			Type  string   `json:"NotificationType"`
+			XUIDs []string `json:"Xuids"`
+		}{
+			Type:  NotificationTypeAdded,
+			XUIDs: []string{"2533274799999999"},
+		})
+		if err != nil {
+			t.Errorf("marshal payload: %v", err)
+			close(handleDone)
+			return
+		}
+		handler.HandleEvent(payload)
+		close(handleDone)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Subscribe from handler returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("handler callback blocked trying to resubscribe")
+	}
+
+	select {
+	case <-handleDone:
+	case <-time.After(time.Second):
+		t.Fatal("HandleEvent did not return after handler callback completed")
 	}
 }
 
@@ -435,6 +534,17 @@ type namedHandler string
 
 func (namedHandler) HandleSocialNotification(string, []string)  {}
 func (namedHandler) HandleIncomingFriendRequestCountChange(int) {}
+
+type subscribeOnNotificationHandler struct {
+	client *Client
+	done   chan<- error
+}
+
+func (h subscribeOnNotificationHandler) HandleSocialNotification(string, []string) {
+	h.done <- h.client.Subscribe(context.Background(), NopSubscriptionHandler{})
+}
+
+func (subscribeOnNotificationHandler) HandleIncomingFriendRequestCountChange(int) {}
 
 type pointerHandler struct{ id string }
 
